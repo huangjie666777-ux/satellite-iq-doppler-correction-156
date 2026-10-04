@@ -98,12 +98,15 @@ class PlaybackController:
 
     def _run(self, plan: dict[str, Any], host: str, port: int,
              tolerance_deg: float, timeout_s: float) -> None:
-        timeline = build_timeline(plan)
-        self._set(progress={"sent": 0, "total": len(timeline)})
         client: RotctlClient | None = None
         final_state = STATE_COMPLETED
         detail = None
         try:
+            try:
+                timeline = build_timeline(plan)
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                raise RotctlError(f"invalid playback plan: {exc}") from exc
+            self._set(progress={"sent": 0, "total": len(timeline)})
             client = RotctlClient(host, port, timeout_s=timeout_s)
             # verify the actual position matches the plan's starting point
             az, el = client.get_position()

@@ -126,3 +126,85 @@ curl -X POST localhost:8000/api/playback/cancel   # 取消
 单位：角度为度（机械方位可超出 [0,360)），角速度为度/秒，时间为秒；
 预置/归位段按 1 秒线性斜坡下发。回放仅按相对时间发设位指令，
 不闭环校正转台实际跟踪误差。
+
+## IQ 录波多普勒校正
+
+`POST /api/iq/correct` 使用 `multipart/form-data`：
+
+- `forecast`：原 `/api/passes` JSON 请求；
+- `satellite_id`、`station_id`：必须是该请求中的卫星和站点；
+- `transmit_frequency_hz`：正、有限发射频率；
+- `metadata`：SigMF `.sigmf-meta`；`samples`：对应的 `.sigmf-data`。
+
+### 输入与可见区间
+
+只接受满足下列条件的单段录波，任一错误均 HTTP 422 整份拒绝，不产生交付：
+
+- 仅单通道 `cf32_le`；仅有一个 capture，`core:sample_start=0`；
+  样本文件长度必须是 8 字节整数倍，无截断或附加字节；
+- 元数据含 UTC 开录时间、正有限中心频率，采样率为 1 kHz～200 kHz；
+- 样本非空、I/Q 全部有限；最多 `2^20` 个复样本且时长不超过 60 秒；
+- 录波从开录到最后样本覆盖的整段时间，必须位于所选卫星/站点的同一可见区间内；
+- 按 1 秒节点计算并包含录波末端，节点间线性插值；任一节点的
+  `|baseband_frequency_hz| >= sample_rate/2` 时拒绝。
+
+径向速度复用 SGP4 轨道传播和站点 ECEF 几何，沿“站点→卫星”视线投影，
+远离为正、靠近为负，单位 m/s。基带频移为：
+
+```text
+f_baseband(t) = f_transmit - f_center
+                - f_transmit * v_radial(t) / c
+```
+
+### 校正、诊断与交付
+
+以开录时刻相位 0 积分频移，对样本乘负相位复指数：
+
+```text
+phi[n] = 2*pi * integral_0^(n/fs) f_baseband(t) dt
+y[n] = x[n] * exp(-j*phi[n])
+```
+
+线性频移用节点间梯形积分；内部分块处理，块间继承累计相位。不重采样、
+不归一化、不改幅度尺度，输出仍为 `cf32_le`，样本数和采样率不变。
+
+诊断使用互不重叠 1024 点 Hann 窗；尾部不足一窗不诊断。每个窗输出校正前后
+FFT 峰频（Hz，范围 `-fs/2..fs/2`，频率分辨率 `fs/1024`）及均方功率
+`mean(|Hann*x|^2)`。返回 `iq_corrected.zip`：
+
+- `corrected.sigmf-meta`：UTC 时间不变，capture 中心频率改为发射频率；
+- `corrected.sigmf-data`：校正复样本；
+- `diagnostics.json`：单位、频移节点、逐窗峰频和功率。
+
+### 可复现示例与 curl
+
+示例为 ISS 对北京站 2024-01-01 02:30:00Z 开始的 2 秒、200 kS/s、
+400000 复样本变频载波；发射频率 1 MHz，原基带中心 995 kHz。重新生成：
+
+```bash
+.venv/bin/python examples/generate_iq_recording.py
+```
+
+启动服务后处理并下载：
+
+```bash
+curl -f -X POST http://127.0.0.1:8000/api/iq/correct \
+  -F "forecast=<examples/request.json;type=application/json" \
+  -F "satellite_id=ISS" \
+  -F "station_id=BEIJING" \
+  -F "transmit_frequency_hz=1000000" \
+  -F "metadata=@examples/iq/example.sigmf-meta;type=application/json" \
+  -F "samples=@examples/iq/example.sigmf-data;type=application/octet-stream" \
+  -o iq_corrected.zip
+.venv/bin/python - <<'PY'
+import json, zipfile
+with zipfile.ZipFile("iq_corrected.zip") as z:
+    print(z.namelist())
+    d = json.loads(z.read("diagnostics.json"))
+    print(d["sample_count"], d["windows"][0])
+PY
+```
+
+近似与限制：模型忽略光行时、相对论、振荡器漂移、接收机滤波器群时延与
+时钟误差；速度来自 TLE/SGP4，只适合计划和演示，不是精密定轨/精密测速。
+中心频率由调谐偏移改到发射频率后，数据表示已把原基带频移搬到零频附近。

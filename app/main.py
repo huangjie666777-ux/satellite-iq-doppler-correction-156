@@ -1,10 +1,14 @@
 """FastAPI entrypoint: offline satellite pass forecast service."""
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
+from pydantic import ValidationError
 
 from .delivery import build_zip, interval_csv_rows, interval_to_dict, render_csv
+from .doppler import doppler_nodes, ensure_recording_interval
+from .iq import IQError, MAX_SAMPLES, SAMPLE_BYTES, build_delivery
+from .iq import check_nyquist, correct_samples, parse_sigmf
 from .passes import HorizonMask, PropagationError, Site, find_passes
 from .playback import PlaybackController
 from .schemas import (MAX_EPOCH_AGE, ForecastRequest, ForecastResponse,
@@ -97,6 +101,68 @@ def forecast_download(req: ForecastRequest):
     return Response(
         content=payload, media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="passes.zip"'})
+
+
+@app.post("/api/iq/correct")
+async def iq_correct(
+    forecast: str = Form(...),
+    satellite_id: str = Form(...),
+    station_id: str = Form(...),
+    transmit_frequency_hz: float = Form(...),
+    metadata: UploadFile = File(...),
+    samples: UploadFile = File(...),
+):
+    try:
+        req = ForecastRequest.model_validate_json(forecast)
+        if not (transmit_frequency_hz > 0.0
+                and transmit_frequency_hz == transmit_frequency_hz):
+            raise ValueError("transmit_frequency_hz must be positive and finite")
+        if not satellite_id or not station_id:
+            raise ValueError("satellite_id and station_id are required")
+        metadata_bytes = await metadata.read(1_048_576)
+        if len(metadata_bytes) == 1_048_576 and await metadata.read(1):
+            raise IQError("SigMF metadata exceeds 1 MiB")
+        sample_bytes = await samples.read(SAMPLE_BYTES * MAX_SAMPLES + 1)
+        if len(sample_bytes) > SAMPLE_BYTES * MAX_SAMPLES:
+            raise IQError("recording exceeds 2^20 complex samples")
+
+        recording = parse_sigmf(metadata_bytes, sample_bytes)
+        results = _compute(req)
+        matches = [r for r in results
+                   if r[0].id == satellite_id and r[2].station_id == station_id]
+        if not matches:
+            raise IQError("satellite/station pair not found in forecast request")
+        duration_s = recording.samples.size / recording.sample_rate_hz
+        selected = None
+        for result in matches:
+            interval = result[3]
+            try:
+                ensure_recording_interval(interval, recording.start_time,
+                                          duration_s)
+                selected = result
+                break
+            except ValueError:
+                continue
+        if selected is None:
+            raise IQError(
+                "recording is not fully inside one visibility interval for "
+                "the selected satellite and station")
+        sat, tle, site, _interval = selected
+        nodes = doppler_nodes(tle.satrec, site, recording.start_time,
+                              duration_s, transmit_frequency_hz,
+                              recording.center_frequency_hz)
+        check_nyquist(nodes, recording.sample_rate_hz)
+        corrected = correct_samples(recording.samples, nodes,
+                                    recording.sample_rate_hz)
+        payload = build_delivery(metadata_bytes, recording, corrected, nodes,
+                                 transmit_frequency_hz)
+    except (IQError, ValueError, ValidationError) as exc:
+        detail = exc.errors() if isinstance(exc, ValidationError) else str(exc)
+        raise HTTPException(status_code=422, detail=detail) from exc
+    return Response(
+        content=payload, media_type="application/zip",
+        headers={"Content-Disposition":
+                 'attachment; filename="iq_corrected.zip"'})
 
 
 @app.get("/api/health")
